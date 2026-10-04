@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" />
+  <title>Chat rAF 离线自检</title>
+  <h1>Chat rAF 离线自检</h1>
+  <p>真实 React Hook + 模拟 SSE；不会连接模型或数据库。</p>
+  <div id="app"></div>
+  <pre id="results">运行中…</pre>
+  <script type="module">
+    const results = document.querySelector('#results')
+    const lines = []
+    const check = (condition, message) => {
+      if (!condition) throw new Error(message)
+    }
+    const passed = (message) => {
+      lines.push(`PASS ${message}`)
+      results.textContent = lines.join('\n')
+    }
+
+    // 可控帧调度：收到事件后先不绘制，也覆盖后台暂停 rAF 时的收尾行为。
+    const frames = new Map()
+    let nextFrameId = 0
+    window.requestAnimationFrame = (callback) => {
+      const id = nextFrameId++
+      frames.set(id, callback)
+      return id
+    }
+    window.cancelAnimationFrame = (id) => frames.delete(id)
+
+    const connections = []
+    const cancellations = []
+    const encoder = new TextEncoder()
+    window.fetch = async (input, init = {}) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url.endsWith('/cancel')) {
+        cancellations.push(url)
+        return new Response('{"status":"cancelled"}', {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      check(url.endsWith('/stream'), `自检不允许访问其他接口：${url}`)
+      const channel = { request: JSON.parse(init.body), closed: false }
+      const close = () => {
+        if (!channel.closed) {
+          channel.closed = true
+          channel.controller.close()
+        }
+      }
+      const body = new ReadableStream({
+        start(controller) {
+          channel.controller = controller
+        },
+        cancel() {
+          channel.closed = true
+        },
+      })
+      init.signal?.addEventListener('abort', close, { once: true })
+      channel.close = close
+      connections.push(channel)
+      return new Response(body, { headers: { 'Content-Type': 'text/event-stream' } })
+    }
+
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true
+    const { act, createElement: h } = await import('react')
+    const { createRoot } = await import('react-dom/client')
+    const { QueryClient, QueryClientProvider } = await import('@tanstack/react-query')
+    const { useStreamChat } = await import('/src/features/chat/hooks/use-chat.ts')
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const root = createRoot(document.querySelector('#app'))
+    let chat
+    function Harness() {
+      chat = useStreamChat()
+      return h('output', { id: 'streaming-content' }, chat.streamingContent)
+    }
+    const flush = async (action = () => {}) => {
+      await act(async () => {
+        action()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      })
+    }
+    const paint = () =>
+      flush(() => {
+        const callbacks = [...frames.values()]
+        frames.clear()
+        callbacks.forEach((callback) => callback(performance.now()))
+      })
+    const emit = (channel, seq, type, content = '') => {
+      const event = {
+        generation_id: channel.request.generation_id,
+        seq,
+        type,
+        content,
+        message: type === 'error' ? '测试失败' : undefined,
+      }
+      channel.controller.enqueue(encoder.encode(`id: ${seq}\ndata: ${JSON.stringify(event)}\n\n`))
+    }
+    const start = async () => {
+      const id = crypto.randomUUID()
+      const run = { id, done: null, error: null, stopped: null }
+      await flush(() => {
+        run.promise = chat.stream('test-session', '离线自检', {
+          generationId: id,
+          onDone: (content) => {
+            run.done = content
+          },
+          onError: (message, content) => {
+            run.error = { message, content }
+          },
+          onStopped: (content) => {
+            run.stopped = content
+          },
+        })
+      })
+      run.channel = connections.at(-1)
+      check(run.channel.request.generation_id === id, '流未建立')
+      return run
+    }
+    const finish = async (run, seq, type = 'done') => {
+      await act(async () => {
+        emit(run.channel, seq, type)
+        run.channel.close()
+        await run.promise
+      })
+    }
+
+    try {
+      await flush(() => root.render(h(QueryClientProvider, { client }, h(Harness))))
+
+      let run = await start()
+      await flush(() => {
+        emit(run.channel, 1, 'token', '张三')
+        emit(run.channel, 2, 'token', '负责')
+        emit(run.channel, 3, 'token', '登录页面😊')
+      })
+      check(chat.streamingContent === '', '绘制前不应逐事件更新 React 状态')
+      check(frames.size === 1 && frames.has(0), '一轮只能安排一个回调，ID=0 也有效')
+      await paint()
+      check(chat.streamingContent === '张三负责登录页面😊', '一帧应合并所有新增文字')
+      await flush(() => emit(run.channel, 4, 'token', '，周五完成。'))
+      await finish(run, 5)
+      check(run.done === '张三负责登录页面😊，周五完成。', '完成时丢失未绘制的尾字')
+      check(!chat.isStreaming && frames.size === 0, '完成后遗留回调或生成状态')
+      passed('多事件合并一帧；完成时保留未绘制的尾字')
+
+      run = await start()
+      await flush(() => emit(run.channel, 1, 'token', '停止前尚未绘制的内容'))
+      await flush(() => chat.stop())
+      await run.promise
+      check(run.stopped === '停止前尚未绘制的内容', '停止时应保留完整接收缓冲')
+      check(frames.size === 0 && !chat.isStreaming, '停止后遗留帧回调')
+      check(
+        cancellations.some((url) => url.includes(run.id)),
+        '停止未发送取消请求',
+      )
+      passed('停止保留完整前缀，并取消帧回调和后端任务')
+
+      run = await start()
+      await flush(() => emit(run.channel, 1, 'token', '失败前缀'))
+      await finish(run, 2, 'error')
+      check(run.error?.content === '失败前缀', '失败时丢失尚未绘制的内容')
+      check(run.error?.message === '测试失败' && frames.size === 0, '错误收尾不完整')
+      passed('失败时也保留尚未绘制的前缀')
+
+      const old = await start()
+      await flush(() => emit(old.channel, 1, 'token', '旧回答'))
+      const staleFrame = [...frames.values()][0]
+      await flush(() => chat.reset())
+      await old.promise
+      check(frames.size === 0, '重置未清理旧帧')
+      run = await start()
+      await flush(() => emit(run.channel, 1, 'token', '新回答'))
+      await flush(() => staleFrame(performance.now()))
+      check(chat.streamingContent === '', '已排队的旧帧写入了新一轮状态')
+      await paint()
+      check(chat.streamingContent === '新回答', '新回答被旧内容污染')
+      await finish(run, 2)
+      passed('切换/重置取消旧帧；迟到回调不能污染新回答')
+
+      run = await start()
+      await flush(() => emit(run.channel, 1, 'token', '断线前'))
+      await flush(() => {
+        run.channel.closed = true
+        run.channel.controller.error(new TypeError('模拟断网'))
+      })
+      await act(async () => {
+        const deadline = performance.now() + 2000
+        while (
+          connections.at(-1).request.generation_id !== run.id ||
+          !connections.at(-1).request.resume
+        ) {
+          check(performance.now() < deadline, '没有恢复订阅')
+          await new Promise((resolve) => setTimeout(resolve, 20))
+        }
+      })
+      run.channel = connections.at(-1)
+      check(run.channel.request.last_seq === 1, '游标错误地依赖页面绘制进度')
+      check(chat.streamingContent === '', '恢复前不应偷偷绕过帧调度')
+      await flush(() => {
+        emit(run.channel, 1, 'token', '断线前') // 重复事件由真实聊天 API 去重。
+        emit(run.channel, 2, 'token', '，恢复后')
+      })
+      check(frames.size === 1, '恢复后重复安排了帧回调')
+      await paint()
+      check(chat.streamingContent === '断线前，恢复后', '恢复丢字或重复追加')
+      await finish(run, 3)
+      passed('未绘制也记录接收游标；重连补发不丢字、不重复')
+
+      run = await start()
+      await flush(() => emit(run.channel, 1, 'token', '卸载前'))
+      const unmountedFrame = [...frames.values()][0]
+      await flush(() => root.unmount())
+      await run.promise
+      await flush(() => unmountedFrame(performance.now()))
+      check(frames.size === 0, '卸载未取消帧回调')
+      check(
+        cancellations.some((url) => url.includes(run.id)),
+        '卸载未取消后端任务',
+      )
+      passed('卸载清理帧和任务；旧回调失效')
+      document.title = 'PASS · Chat rAF 离线自检'
+      results.dataset.status = 'passed'
+    } catch (error) {
+      results.textContent = [...lines, `FAIL ${error.stack || error}`].join('\n')
+      results.dataset.status = 'failed'
+      document.title = 'FAIL · Chat rAF 离线自检'
+      console.error(error)
+    } finally {
+      client.clear()
+    }
+  </script>
+</html>

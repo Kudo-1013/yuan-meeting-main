@@ -1,0 +1,46 @@
+# 环境变量（含 API Key，禁止上传）
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.venv
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+frontend/dist/
+
+# 上传的音频文件
+backend/uploads/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# AI 生成的文档（不上传 git）
+*.md
+!README.md
+!AGENTS.md
+!LEARNING_HANDOFF.md
+docs/
+
+# 本地缓存、临时验证产物与安装的技能
+.uv-cache/
+.python/
+.npm-cache/
+.agents/
+tmp/
+*.log
+.pytest_cache/
+*.sqlite
+*.sqlite3
+*.db
